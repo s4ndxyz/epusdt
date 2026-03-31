@@ -41,11 +41,27 @@ jobs:
         with:
           go-version-file: src/go.mod
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v4.1.1
+      - name: Select Previous Stable Tag For Final Releases
+        run: |
+          current_tag="${GITHUB_REF_NAME}"
+          if [[ "$current_tag" == *-* ]]; then
+            echo "prerelease tag detected: $current_tag"
+            exit 0
+          fi
 
-      - name: Install Syft
-        uses: anchore/sbom-action/download-syft@v0.24.0
+          previous_stable_tag="$(
+            git tag --list 'v*' --sort=-version:refname |
+              grep -Fxv "$current_tag" |
+              grep -Ev -- '-' |
+              head -n 1
+          )"
+
+          if [[ -n "$previous_stable_tag" ]]; then
+            echo "using previous stable tag: $previous_stable_tag"
+            echo "GORELEASER_PREVIOUS_TAG=$previous_stable_tag" >> "$GITHUB_ENV"
+          else
+            echo "no previous stable tag found"
+          fi
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
@@ -60,7 +76,4 @@ jobs:
       - name: Attest Release Artifacts
         uses: actions/attest@v4
         with:
-          subject-path: |
-            src/dist/*.tar.gz
-            src/dist/*.zip
-            src/dist/*_checksums.txt
+          subject-checksums: src/dist/SHA256SUMS

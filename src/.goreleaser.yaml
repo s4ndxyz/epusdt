@@ -28,7 +28,7 @@ archives:
   - id: epusdt
     ids:
       - epusdt
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
     files:
       - .env.example
       - static/**
@@ -38,21 +38,7 @@ archives:
           - zip
 
 checksum:
-  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
-
-signs:
-  - cmd: cosign
-    signature: "${artifact}.sigstore.json"
-    args:
-      - "sign-blob"
-      - "--bundle=${signature}"
-      - "${artifact}"
-      - "--yes"
-    artifacts: checksum
-
-sboms:
-  - id: archives
-    artifacts: archive
+  name_template: "SHA256SUMS"
 
 snapshot:
   name_template: "{{ incpatch .Version }}-next"
@@ -61,6 +47,7 @@ release:
   github:
     owner: GMwalletApp
     name: epusdt
+  prerelease: auto
 
 changelog:
   sort: asc
@@ -70,3 +57,6 @@ changelog:
       - "^test:"
       - "^chore:"
       - "^ci:"
+      - "^fix\\(ci\\):"
+      - "^build\\(release\\):"
+      - "^Merge pull request"
