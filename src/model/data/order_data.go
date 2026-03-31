@@ -1,109 +1,184 @@
 package data
 
 import (
-	"context"
-	"fmt"
+	"errors"
+	"strings"
+	"time"
+
 	"github.com/assimon/luuu/model/dao"
 	"github.com/assimon/luuu/model/mdb"
 	"github.com/assimon/luuu/model/request"
-	"github.com/go-redis/redis/v8"
+	"github.com/dromara/carbon/v2"
+	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
-	"time"
+	"gorm.io/gorm/clause"
 )
 
-var (
-	CacheWalletAddressWithAmountToTradeIdKey = "wallet:%s_%v" // 钱包_待支付金额 : 交易号
-)
+var ErrTransactionLocked = errors.New("transaction amount is already locked")
 
-// GetOrderInfoByOrderId 通过客户订单号查询订单
+type PendingCallbackOrder struct {
+	TradeId         string      `gorm:"column:trade_id"`
+	CallbackNum     int         `gorm:"column:callback_num"`
+	CallBackConfirm int         `gorm:"column:callback_confirm"`
+	UpdatedAt       carbon.Time `gorm:"column:updated_at"`
+}
+
+func normalizeLockAmount(amount float64) (int64, string) {
+	value := decimal.NewFromFloat(amount).Round(2)
+	return value.Shift(2).IntPart(), value.StringFixed(2)
+}
+
+func normalizeLockToken(token string) string {
+	return strings.ToUpper(strings.TrimSpace(token))
+}
+
+// GetOrderInfoByOrderId fetches an order by merchant order id.
 func GetOrderInfoByOrderId(orderId string) (*mdb.Orders, error) {
 	order := new(mdb.Orders)
 	err := dao.Mdb.Model(order).Limit(1).Find(order, "order_id = ?", orderId).Error
 	return order, err
 }
 
-// GetOrderInfoByTradeId 通过交易号查询订单
+// GetOrderInfoByTradeId fetches an order by epusdt trade id.
 func GetOrderInfoByTradeId(tradeId string) (*mdb.Orders, error) {
 	order := new(mdb.Orders)
 	err := dao.Mdb.Model(order).Limit(1).Find(order, "trade_id = ?", tradeId).Error
 	return order, err
 }
 
-// CreateOrderWithTransaction 事务创建订单
+// CreateOrderWithTransaction creates an order in the active database transaction.
 func CreateOrderWithTransaction(tx *gorm.DB, order *mdb.Orders) error {
-	err := tx.Model(order).Create(order).Error
-	return err
+	return tx.Model(order).Create(order).Error
 }
 
-// GetOrderByBlockIdWithTransaction 通过区块获取订单
-func GetOrderByBlockIdWithTransaction(tx *gorm.DB, blockId string) (*mdb.Orders, error) {
+// GetOrderByBlockIdWithTransaction fetches an order by blockchain tx id.
+func GetOrderByBlockIdWithTransaction(tx *gorm.DB, blockID string) (*mdb.Orders, error) {
 	order := new(mdb.Orders)
-	err := tx.Model(order).Limit(1).Find(order, "block_transaction_id = ?", blockId).Error
+	err := tx.Model(order).Limit(1).Find(order, "block_transaction_id = ?", blockID).Error
 	return order, err
 }
 
-// OrderSuccessWithTransaction 事务支付成功
-func OrderSuccessWithTransaction(tx *gorm.DB, req *request.OrderProcessingRequest) error {
-	err := tx.Model(&mdb.Orders{}).Where("trade_id = ?", req.TradeId).Updates(map[string]interface{}{
-		"block_transaction_id": req.BlockTransactionId,
-		"status":               mdb.StatusPaySuccess,
-		"callback_confirm":     mdb.CallBackConfirmNo,
-	}).Error
-	return err
+// OrderSuccessWithTransaction marks an order as paid only if it is still waiting for payment.
+func OrderSuccessWithTransaction(tx *gorm.DB, req *request.OrderProcessingRequest) (bool, error) {
+	result := tx.Model(&mdb.Orders{}).
+		Where("trade_id = ?", req.TradeId).
+		Where("status = ?", mdb.StatusWaitPay).
+		Updates(map[string]interface{}{
+			"block_transaction_id": req.BlockTransactionId,
+			"status":               mdb.StatusPaySuccess,
+			"callback_confirm":     mdb.CallBackConfirmNo,
+		})
+	return result.RowsAffected > 0, result.Error
 }
 
-// GetPendingCallbackOrders 查询出等待回调的订单
-func GetPendingCallbackOrders() ([]mdb.Orders, error) {
-	var orders []mdb.Orders
-	err := dao.Mdb.Model(orders).
-		Where("callback_num < ?", 5).
+// GetPendingCallbackOrders returns the minimal callback scheduling state.
+func GetPendingCallbackOrders(maxRetry int, limit int) ([]PendingCallbackOrder, error) {
+	var orders []PendingCallbackOrder
+	query := dao.Mdb.Model(&mdb.Orders{}).
+		Select("trade_id", "callback_num", "callback_confirm", "updated_at").
+		Where("callback_num <= ?", maxRetry).
 		Where("callback_confirm = ?", mdb.CallBackConfirmNo).
 		Where("status = ?", mdb.StatusPaySuccess).
-		Find(&orders).Error
+		Order("updated_at asc")
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	err := query.Find(&orders).Error
 	return orders, err
 }
 
-// SaveCallBackOrdersResp 保存订单回调结果
+// SaveCallBackOrdersResp persists a callback attempt result.
 func SaveCallBackOrdersResp(order *mdb.Orders) error {
-	err := dao.Mdb.Model(order).Where("id = ?", order.ID).Updates(map[string]interface{}{
-		"callback_num":     gorm.Expr("callback_num + ?", 1),
-		"callback_confirm": order.CallBackConfirm,
-	}).Error
-	return err
+	return dao.Mdb.Model(order).
+		Where("id = ?", order.ID).
+		Where("callback_confirm = ?", mdb.CallBackConfirmNo).
+		Updates(map[string]interface{}{
+			"callback_num":     gorm.Expr("callback_num + ?", 1),
+			"callback_confirm": order.CallBackConfirm,
+		}).Error
 }
 
-// UpdateOrderIsExpirationById 通过id设置订单过期
-func UpdateOrderIsExpirationById(id uint64) error {
-	err := dao.Mdb.Model(mdb.Orders{}).Where("id = ?", id).Update("status", mdb.StatusExpired).Error
-	return err
+// UpdateOrderIsExpirationById expires an order only if it is still pending and already timed out.
+func UpdateOrderIsExpirationById(id uint64, expirationCutoff time.Time) (bool, error) {
+	result := dao.Mdb.Model(mdb.Orders{}).
+		Where("id = ?", id).
+		Where("status = ?", mdb.StatusWaitPay).
+		Where("created_at <= ?", expirationCutoff).
+		Update("status", mdb.StatusExpired)
+	return result.RowsAffected > 0, result.Error
 }
 
-// GetTradeIdByWalletAddressAndAmount 通过钱包地址，支付金额获取交易号
-func GetTradeIdByWalletAddressAndAmount(token string, amount float64) (string, error) {
-	ctx := context.Background()
-	cacheKey := fmt.Sprintf(CacheWalletAddressWithAmountToTradeIdKey, token, amount)
-	result, err := dao.Rdb.Get(ctx, cacheKey).Result()
-	if err == redis.Nil {
-		return "", nil
-	}
+// GetTradeIdByWalletAddressAndAmountAndToken resolves the reserved trade id by address, token and amount.
+func GetTradeIdByWalletAddressAndAmountAndToken(address string, token string, amount float64) (string, error) {
+	scaledAmount, _ := normalizeLockAmount(amount)
+	var lock mdb.TransactionLock
+	err := dao.RuntimeDB.Model(&mdb.TransactionLock{}).
+		Where("address = ?", address).
+		Where("token = ?", normalizeLockToken(token)).
+		Where("amount_scaled = ?", scaledAmount).
+		Where("expires_at > ?", time.Now()).
+		Limit(1).
+		Find(&lock).Error
 	if err != nil {
 		return "", err
 	}
-	return result, nil
+	if lock.ID <= 0 {
+		return "", nil
+	}
+	return lock.TradeId, nil
 }
 
-// LockTransaction 锁定交易
-func LockTransaction(token, tradeId string, amount float64, expirationTime time.Duration) error {
-	ctx := context.Background()
-	cacheKey := fmt.Sprintf(CacheWalletAddressWithAmountToTradeIdKey, token, amount)
-	err := dao.Rdb.Set(ctx, cacheKey, tradeId, expirationTime).Err()
-	return err
+// LockTransaction reserves an address+token+amount pair in sqlite until expiration.
+func LockTransaction(address, token, tradeID string, amount float64, expirationTime time.Duration) error {
+	scaledAmount, amountText := normalizeLockAmount(amount)
+	normalizedToken := normalizeLockToken(token)
+	now := time.Now()
+	lock := &mdb.TransactionLock{
+		Address:      address,
+		Token:        normalizedToken,
+		AmountScaled: scaledAmount,
+		AmountText:   amountText,
+		TradeId:      tradeID,
+		ExpiresAt:    now.Add(expirationTime),
+	}
+
+	return dao.RuntimeDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("address = ?", address).
+			Where("token = ?", normalizedToken).
+			Where("amount_scaled = ?", scaledAmount).
+			Where("expires_at <= ?", now).
+			Delete(&mdb.TransactionLock{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("trade_id = ?", tradeID).Delete(&mdb.TransactionLock{}).Error; err != nil {
+			return err
+		}
+
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(lock)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrTransactionLocked
+		}
+		return nil
+	})
 }
 
-// UnLockTransaction 解锁交易
-func UnLockTransaction(token string, amount float64) error {
-	ctx := context.Background()
-	cacheKey := fmt.Sprintf(CacheWalletAddressWithAmountToTradeIdKey, token, amount)
-	err := dao.Rdb.Del(ctx, cacheKey).Err()
-	return err
+// UnLockTransaction releases the reservation for address+token+amount.
+func UnLockTransaction(address string, token string, amount float64) error {
+	scaledAmount, _ := normalizeLockAmount(amount)
+	return dao.RuntimeDB.
+		Where("address = ?", address).
+		Where("token = ?", normalizeLockToken(token)).
+		Where("amount_scaled = ?", scaledAmount).
+		Delete(&mdb.TransactionLock{}).Error
+}
+
+func UnLockTransactionByTradeId(tradeID string) error {
+	return dao.RuntimeDB.Where("trade_id = ?", tradeID).Delete(&mdb.TransactionLock{}).Error
+}
+
+func CleanupExpiredTransactionLocks() error {
+	return dao.RuntimeDB.Where("expires_at <= ?", time.Now()).Delete(&mdb.TransactionLock{}).Error
 }

@@ -1,161 +1,281 @@
 package service
 
 import (
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/assimon/luuu/config"
-	"github.com/spf13/viper"
-
+	tron "github.com/assimon/luuu/crypto"
 	"github.com/assimon/luuu/model/data"
+	"github.com/assimon/luuu/model/mdb"
 	"github.com/assimon/luuu/model/request"
-	"github.com/assimon/luuu/mq"
-	"github.com/assimon/luuu/mq/handle"
 	"github.com/assimon/luuu/telegram"
+	"github.com/assimon/luuu/util/constant"
 	"github.com/assimon/luuu/util/http_client"
-	"github.com/assimon/luuu/util/json"
 	"github.com/assimon/luuu/util/log"
+	"github.com/assimon/luuu/util/math"
 	"github.com/dromara/carbon/v2"
 	"github.com/gookit/goutil/stdutil"
-	"github.com/hibiken/asynq"
 	"github.com/shopspring/decimal"
+	"github.com/tidwall/gjson"
 )
 
-const UsdtTrc20ApiUri = "https://apilist.tronscanapi.com/api/transfer/trc20"
+const TRC20_USDT_ID = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
-type UsdtTrc20Resp struct {
-	PageSize int    `json:"page_size"`
-	Code     int    `json:"code"`
-	Data     []Data `json:"data"`
-}
-
-type TokenInfo struct {
-	TokenID      string `json:"tokenId"`
-	TokenAbbr    string `json:"tokenAbbr"`
-	TokenName    string `json:"tokenName"`
-	TokenDecimal int    `json:"tokenDecimal"`
-	TokenCanShow int    `json:"tokenCanShow"`
-	TokenType    string `json:"tokenType"`
-	TokenLogo    string `json:"tokenLogo"`
-	TokenLevel   string `json:"tokenLevel"`
-	IssuerAddr   string `json:"issuerAddr"`
-	Vip          bool   `json:"vip"`
-}
-
-type Data struct {
-	Amount         string `json:"amount"`
-	ApprovalAmount string `json:"approval_amount"`
-	BlockTimestamp int64  `json:"block_timestamp"`
-	Block          int    `json:"block"`
-	From           string `json:"from"`
-	To             string `json:"to"`
-	Hash           string `json:"hash"`
-	Confirmed      int    `json:"confirmed"`
-	ContractType   string `json:"contract_type"`
-	ContracTType   int    `json:"contractType"`
-	Revert         int    `json:"revert"`
-	ContractRet    string `json:"contract_ret"`
-	EventType      string `json:"event_type"`
-	IssueAddress   string `json:"issue_address"`
-	Decimals       int    `json:"decimals"`
-	TokenName      string `json:"token_name"`
-	ID             string `json:"id"`
-	Direction      int    `json:"direction"`
-}
-
-// Trc20CallBack trc20回调
-func Trc20CallBack(token string, wg *sync.WaitGroup) {
+func Trc20CallBack(address string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer func() {
 		if err := recover(); err != nil {
 			log.Sugar.Error(err)
 		}
 	}()
+
+	var innerWg sync.WaitGroup
+	innerWg.Add(2)
+	go checkTrxTransfers(address, &innerWg)
+	go checkTrc20Transfers(address, &innerWg)
+	innerWg.Wait()
+}
+
+func checkTrxTransfers(address string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer func() {
+		if err := recover(); err != nil {
+			log.Sugar.Errorf("[TRX][%s] panic recovered: %v", address, err)
+		}
+	}()
+
 	client := http_client.GetHttpClient()
 	startTime := carbon.Now().AddHours(-24).TimestampMilli()
 	endTime := carbon.Now().TimestampMilli()
+	url := fmt.Sprintf("https://api.trongrid.io/v1/accounts/%s/transactions", address)
+
 	resp, err := client.R().SetQueryParams(map[string]string{
-		"sort":            "-timestamp",
-		"limit":           "50",
-		"start":           "0",
-		"direction":       "2",
-		"db_version":      "1",
-		"trc20Id":         "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
-		"address":         token,
-		"start_timestamp": stdutil.ToString(startTime),
-		"end_timestamp":   stdutil.ToString(endTime),
-	}).Get(UsdtTrc20ApiUri)
+		"order_by":      "block_timestamp,desc",
+		"limit":         "100",
+		"only_to":       "true",
+		"min_timestamp": stdutil.ToString(startTime),
+		"max_timestamp": stdutil.ToString(endTime),
+	}).SetHeader("TRON-PRO-API-KEY", config.TRON_GRID_API_KEY).Get(url)
 	if err != nil {
 		panic(err)
 	}
 	if resp.StatusCode() != http.StatusOK {
-		panic(err)
+		panic(fmt.Sprintf("TRX API returned status %d", resp.StatusCode()))
 	}
-	var trc20Resp UsdtTrc20Resp
-	err = json.Cjson.Unmarshal(resp.Body(), &trc20Resp)
-	if err != nil {
-		panic(err)
+
+	success := gjson.GetBytes(resp.Body(), "success").Bool()
+	if !success {
+		panic("TRX API response indicates failure")
 	}
-	if trc20Resp.PageSize <= 0 {
+
+	transfers := gjson.GetBytes(resp.Body(), "data").Array()
+	if len(transfers) == 0 {
+		log.Sugar.Debugf("[TRX][%s] no transfer records found", address)
 		return
 	}
-	for _, transfer := range trc20Resp.Data {
-		if transfer.To != token || transfer.ContractRet != "SUCCESS" {
+	log.Sugar.Debugf("[TRX][%s] fetched %d transfer records", address, len(transfers))
+
+	for i, transfer := range transfers {
+		if transfer.Get("raw_data.contract.0.type").String() != "TransferContract" {
 			continue
 		}
-		decimalQuant, err := decimal.NewFromString(transfer.Amount)
-		if err != nil {
-			panic(err)
-		}
-		decimalDivisor := decimal.NewFromFloat(1000000)
-		amount := decimalQuant.Div(decimalDivisor).InexactFloat64()
-		tradeId, err := data.GetTradeIdByWalletAddressAndAmount(token, amount)
-		if err != nil {
-			panic(err)
-		}
-		if tradeId == "" {
+		if transfer.Get("ret.0.contractRet").String() != "SUCCESS" {
 			continue
 		}
-		order, err := data.GetOrderInfoByTradeId(tradeId)
+
+		toAddressHex := transfer.Get("raw_data.contract.0.parameter.value.to_address").String()
+		toBytes, err := hex.DecodeString(toAddressHex)
+		if err != nil {
+			log.Sugar.Errorf("[TRX][%s] decode address failed on tx #%d: %v", address, i, err)
+			continue
+		}
+		if tron.EncodeCheck(toBytes) != address {
+			continue
+		}
+
+		rawAmount := transfer.Get("raw_data.contract.0.parameter.value.amount").String()
+		decimalQuant, err := decimal.NewFromString(rawAmount)
+		if err != nil {
+			log.Sugar.Errorf("[TRX][%s] parse amount failed on tx #%d: %v", address, i, err)
+			continue
+		}
+		amount := math.MustParsePrecFloat64(decimalQuant.Div(decimal.NewFromInt(1000000)).InexactFloat64(), 2)
+		if amount <= 0 {
+			continue
+		}
+
+		txID := transfer.Get("txID").String()
+		tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(address, "TRX", amount)
 		if err != nil {
 			panic(err)
 		}
-		// 区块的确认时间必须在订单创建时间之后
+		if tradeID == "" {
+			log.Sugar.Debugf("[TRX][%s] skip unmatched tx hash=%s amount=%.2f", address, txID, amount)
+			continue
+		}
+		log.Sugar.Infof("[TRX][%s] matched trade_id=%s hash=%s amount=%.2f", address, tradeID, txID, amount)
+
+		order, err := data.GetOrderInfoByTradeId(tradeID)
+		if err != nil {
+			panic(err)
+		}
+		blockTimestamp := transfer.Get("block_timestamp").Int()
 		createTime := order.CreatedAt.TimestampMilli()
-		if transfer.BlockTimestamp < createTime {
-			panic("Orders cannot actually be matched")
+		if blockTimestamp < createTime {
+			log.Sugar.Warnf("[TRX][%s] skip tx %s because block time %d is before order create time %d", address, txID, blockTimestamp, createTime)
+			continue
 		}
-		// 到这一步就完全算是支付成功了
+
 		req := &request.OrderProcessingRequest{
-			Token:              token,
-			TradeId:            tradeId,
+			ReceiveAddress:     address,
+			Token:              "TRX",
+			TradeId:            tradeID,
 			Amount:             amount,
-			BlockTransactionId: transfer.Hash,
+			BlockTransactionId: txID,
 		}
 		err = OrderProcessing(req)
 		if err != nil {
+			if errors.Is(err, constant.OrderBlockAlreadyProcess) || errors.Is(err, constant.OrderStatusConflict) {
+				log.Sugar.Infof("[TRX][%s] skip resolved transfer trade_id=%s hash=%s err=%v", address, tradeID, txID, err)
+				continue
+			}
 			panic(err)
 		}
-		// 回调队列
-		orderCallbackQueue, _ := handle.NewOrderCallbackQueue(order)
-		orderNoticeMaxRetry := viper.GetInt("order_notice_max_retry")
-		mq.MClient.Enqueue(orderCallbackQueue, asynq.MaxRetry(orderNoticeMaxRetry),
-			asynq.Retention(config.GetOrderExpirationTimeDuration()),
-		)
-		// mq.MClient.Enqueue(orderCallbackQueue, asynq.MaxRetry(5))
-		// 发送机器人消息
-		msgTpl := `
-<b>📢📢有新的交易支付成功！</b>
-<pre>交易号：%s</pre>
-<pre>订单号：%s</pre>
-<pre>请求支付金额：%f cny</pre>
-<pre>实际支付金额：%f usdt</pre>
-<pre>钱包地址：%s</pre>
-<pre>订单创建时间：%s</pre>
-<pre>支付成功时间：%s</pre>
-`
-		msg := fmt.Sprintf(msgTpl, order.TradeId, order.OrderId, order.Amount, order.ActualAmount, order.Token, order.CreatedAt.ToDateTimeString(), carbon.Now().ToDateTimeString())
-		telegram.SendToBot(msg)
+
+		sendPaymentNotification(order)
+		log.Sugar.Infof("[TRX][%s] payment processed trade_id=%s hash=%s", address, tradeID, txID)
 	}
+}
+
+func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer func() {
+		if err := recover(); err != nil {
+			log.Sugar.Errorf("[TRC20][%s] panic recovered: %v", address, err)
+		}
+	}()
+
+	client := http_client.GetHttpClient()
+	startTime := carbon.Now().AddHours(-24).TimestampMilli()
+	endTime := carbon.Now().TimestampMilli()
+	url := fmt.Sprintf("https://api.trongrid.io/v1/accounts/%s/transactions/trc20", address)
+
+	resp, err := client.R().SetQueryParams(map[string]string{
+		"order_by":      "block_timestamp,desc",
+		"limit":         "100",
+		"only_to":       "true",
+		"min_timestamp": stdutil.ToString(startTime),
+		"max_timestamp": stdutil.ToString(endTime),
+	}).SetHeader("TRON-PRO-API-KEY", config.TRON_GRID_API_KEY).Get(url)
+	if err != nil {
+		panic(err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		panic(fmt.Sprintf("TRC20 API returned status %d", resp.StatusCode()))
+	}
+
+	success := gjson.GetBytes(resp.Body(), "success").Bool()
+	if !success {
+		panic("TRC20 API response indicates failure")
+	}
+
+	transfers := gjson.GetBytes(resp.Body(), "data").Array()
+	if len(transfers) == 0 {
+		log.Sugar.Debugf("[TRC20][%s] no transfer records found", address)
+		return
+	}
+	log.Sugar.Debugf("[TRC20][%s] fetched %d transfer records", address, len(transfers))
+
+	for i, transfer := range transfers {
+		if transfer.Get("token_info.address").String() != TRC20_USDT_ID {
+			continue
+		}
+		if transfer.Get("to").String() != address {
+			continue
+		}
+
+		valueStr := transfer.Get("value").String()
+		decimalQuant, err := decimal.NewFromString(valueStr)
+		if err != nil {
+			log.Sugar.Errorf("[TRC20][%s] parse value failed on tx #%d: %v", address, i, err)
+			continue
+		}
+		tokenDecimals := transfer.Get("token_info.decimals").Int()
+		amount := math.MustParsePrecFloat64(decimalQuant.Div(decimal.New(1, int32(tokenDecimals))).InexactFloat64(), 2)
+		if amount <= 0 {
+			continue
+		}
+
+		txID := transfer.Get("transaction_id").String()
+		tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(address, "USDT", amount)
+		if err != nil {
+			panic(err)
+		}
+		if tradeID == "" {
+			log.Sugar.Debugf("[TRC20][%s] skip unmatched tx hash=%s amount=%.2f", address, txID, amount)
+			continue
+		}
+		log.Sugar.Infof("[TRC20][%s] matched trade_id=%s hash=%s amount=%.2f", address, tradeID, txID, amount)
+
+		order, err := data.GetOrderInfoByTradeId(tradeID)
+		if err != nil {
+			panic(err)
+		}
+		blockTimestamp := transfer.Get("block_timestamp").Int()
+		createTime := order.CreatedAt.TimestampMilli()
+		if blockTimestamp < createTime {
+			log.Sugar.Warnf("[TRC20][%s] skip tx %s because block time %d is before order create time %d", address, txID, blockTimestamp, createTime)
+			continue
+		}
+
+		req := &request.OrderProcessingRequest{
+			ReceiveAddress:     address,
+			Token:              "USDT",
+			TradeId:            tradeID,
+			Amount:             amount,
+			BlockTransactionId: txID,
+		}
+		err = OrderProcessing(req)
+		if err != nil {
+			if errors.Is(err, constant.OrderBlockAlreadyProcess) || errors.Is(err, constant.OrderStatusConflict) {
+				log.Sugar.Infof("[TRC20][%s] skip resolved transfer trade_id=%s hash=%s err=%v", address, tradeID, txID, err)
+				continue
+			}
+			panic(err)
+		}
+
+		sendPaymentNotification(order)
+		log.Sugar.Infof("[TRC20][%s] payment processed trade_id=%s hash=%s", address, tradeID, txID)
+	}
+}
+
+func sendPaymentNotification(order *mdb.Orders) {
+	msg := fmt.Sprintf(
+		"🎉 <b>收款成功通知</b>\n\n"+
+			"💰 <b>金额信息</b>\n"+
+			"├ 订单金额：<code>%.2f %s</code>\n"+
+			"└ 实际到账：<code>%.2f %s</code>\n\n"+
+			"📋 <b>订单信息</b>\n"+
+			"├ 交易号：<code>%s</code>\n"+
+			"├ 订单号：<code>%s</code>\n"+
+			"└ 钱包地址：<code>%s</code>\n\n"+
+			"⏰ <b>时间信息</b>\n"+
+			"├ 创建时间：%s\n"+
+			"└ 支付时间：%s",
+		order.Amount,
+		strings.ToUpper(order.Currency),
+		order.ActualAmount,
+		strings.ToUpper(order.Token),
+		order.TradeId,
+		order.OrderId,
+		order.ReceiveAddress,
+		order.CreatedAt.ToDateTimeString(),
+		carbon.Now().ToDateTimeString(),
+	)
+	telegram.SendToBot(msg)
 }

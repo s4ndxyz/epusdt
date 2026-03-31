@@ -1,16 +1,17 @@
 package route
 
 import (
+	"net/http"
+
 	"github.com/assimon/luuu/controller/comm"
 	"github.com/assimon/luuu/middleware"
 	"github.com/labstack/echo/v4"
-	"net/http"
 )
 
 // RegisterRoute 路由注册
 func RegisterRoute(e *echo.Echo) {
 	e.Any("/", func(c echo.Context) error {
-		return c.String(http.StatusOK, "hello epusdt, https://github.com/assimon/epusdt")
+		return c.String(http.StatusOK, "hello epusdt, https://github.com/GMwalletApp/epusdt")
 	})
 	// ==== 支付相关=====
 	payRoute := e.Group("/pay")

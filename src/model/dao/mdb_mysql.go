@@ -29,7 +29,7 @@ func MysqlInit() error {
 		// panic(err)
 		return err
 	}
-	if config.AppDebug {
+	if config.SQLDebug {
 		Mdb = Mdb.Debug()
 	}
 	sqlDB, err := Mdb.DB()

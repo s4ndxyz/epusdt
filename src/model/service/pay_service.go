@@ -9,18 +9,20 @@ import (
 	"github.com/assimon/luuu/model/response"
 )
 
-// GetCheckoutCounterByTradeId 获取收银台详情，通过订单
+// GetCheckoutCounterByTradeId returns checkout info for a pending order.
 func GetCheckoutCounterByTradeId(tradeId string) (*response.CheckoutCounterResponse, error) {
 	orderInfo, err := data.GetOrderInfoByTradeId(tradeId)
 	if err != nil {
 		return nil, err
 	}
 	if orderInfo.ID <= 0 || orderInfo.Status != mdb.StatusWaitPay {
-		return nil, errors.New("不存在待支付订单或已过期！")
+		return nil, errors.New("不存在待支付订单或已过期")
 	}
+
 	resp := &response.CheckoutCounterResponse{
 		TradeId:        orderInfo.TradeId,
 		ActualAmount:   orderInfo.ActualAmount,
+		ReceiveAddress: orderInfo.ReceiveAddress,
 		Token:          orderInfo.Token,
 		ExpirationTime: orderInfo.CreatedAt.AddMinutes(config.GetOrderExpirationTime()).TimestampMilli(),
 		RedirectUrl:    orderInfo.RedirectUrl,
