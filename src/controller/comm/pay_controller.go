@@ -1,13 +1,13 @@
 package comm
 
 import (
-	"fmt"
 	"github.com/assimon/luuu/config"
 	"github.com/assimon/luuu/model/response"
 	"github.com/assimon/luuu/model/service"
 	"github.com/labstack/echo/v4"
 	"html/template"
 	"net/http"
+	"path/filepath"
 )
 
 // CheckoutCounter 收银台
@@ -17,7 +17,7 @@ func (c *BaseCommController) CheckoutCounter(ctx echo.Context) (err error) {
 	if err != nil {
 		return ctx.String(http.StatusOK, err.Error())
 	}
-	tmpl, err := template.ParseFiles(fmt.Sprintf(".%s/%s", config.StaticPath, "index.html"))
+	tmpl, err := template.ParseFiles(filepath.Join(config.StaticFilePath, "index.html"))
 	if err != nil {
 		return ctx.String(http.StatusOK, err.Error())
 	}

@@ -40,7 +40,7 @@ func PostgreSQLInit() error {
 		return err
 	}
 
-	if config.AppDebug {
+	if config.SQLDebug {
 		Mdb = Mdb.Debug()
 	}
 	sqlDB, err := Mdb.DB()

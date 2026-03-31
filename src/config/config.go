@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -15,37 +16,50 @@ import (
 )
 
 var (
-	AppDebug          bool
-	MysqlDns          string
-	RuntimePath       string
-	LogSavePath       string
-	StaticPath        string
-	TgBotToken        string
-	TgProxy           string
-	TgManage          int64
-	UsdtRate          float64
-	RateApiUrl        string
-	TRON_GRID_API_KEY string
-	BuildVersion      = "0.0.0-dev"
-	BuildCommit       = "none"
-	BuildDate         = "unknown"
+	HTTPAccessLog      bool
+	SQLDebug           bool
+	LogLevel           string
+	MysqlDns           string
+	RuntimePath        string
+	LogSavePath        string
+	StaticPath         string
+	StaticFilePath     string
+	TgBotToken         string
+	TgProxy            string
+	TgManage           int64
+	UsdtRate           float64
+	RateApiUrl         string
+	TRON_GRID_API_KEY  string
+	BuildVersion       = "0.0.0-dev"
+	BuildCommit        = "none"
+	BuildDate          = "unknown"
+	configRootPath     string
+	explicitConfigPath string
 )
 
+func SetConfigPath(path string) {
+	explicitConfigPath = strings.TrimSpace(path)
+}
+
 func Init() {
-	viper.AddConfigPath("./")
-	viper.SetConfigFile(".env")
-	err := viper.ReadInConfig()
+	configPath, err := resolveConfigFilePath()
 	if err != nil {
 		panic(err)
 	}
-	gwd, err := os.Getwd()
+	configRootPath = filepath.Dir(configPath)
+
+	viper.SetConfigFile(configPath)
+	err = viper.ReadInConfig()
 	if err != nil {
 		panic(err)
 	}
-	AppDebug = viper.GetBool("app_debug")
-	StaticPath = viper.GetString("static_path")
-	RuntimePath = fmt.Sprintf("%s%s", gwd, viper.GetString("runtime_root_path"))
-	LogSavePath = fmt.Sprintf("%s%s", RuntimePath, viper.GetString("log_save_path"))
+	HTTPAccessLog = viper.GetBool("http_access_log")
+	SQLDebug = viper.GetBool("sql_debug")
+	LogLevel = normalizeLogLevel(viper.GetString("log_level"))
+	StaticPath = normalizeStaticURLPath(viper.GetString("static_path"))
+	StaticFilePath = filepath.Join(configRootPath, strings.TrimPrefix(StaticPath, "/"))
+	RuntimePath = resolvePathFromBase(configRootPath, viper.GetString("runtime_root_path"), filepath.Join(configRootPath, "runtime"))
+	LogSavePath = resolvePathFromBase(RuntimePath, viper.GetString("log_save_path"), filepath.Join(RuntimePath, "logs"))
 	mustMkdir(RuntimePath)
 	mustMkdir(LogSavePath)
 	MysqlDns = fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
@@ -65,6 +79,79 @@ func mustMkdir(path string) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		panic(err)
 	}
+}
+
+func normalizeLogLevel(level string) string {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug", "info", "warn", "error":
+		return strings.ToLower(strings.TrimSpace(level))
+	default:
+		return "info"
+	}
+}
+
+func normalizeStaticURLPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || path == "/" {
+		return "/static"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
+}
+
+func resolvePathFromBase(basePath string, path string, fallback string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fallback
+	}
+	if filepath.IsAbs(path) {
+		return path
+	}
+	path = strings.TrimPrefix(path, "/")
+	path = strings.TrimPrefix(path, "\\")
+	return filepath.Join(basePath, filepath.FromSlash(path))
+}
+
+func resolveConfigFilePath() (string, error) {
+	if explicitConfigPath != "" {
+		return normalizeConfiguredPath(explicitConfigPath)
+	}
+	if envPath := strings.TrimSpace(os.Getenv("EPUSDT_CONFIG")); envPath != "" {
+		return normalizeConfiguredPath(envPath)
+	}
+	return normalizeConfiguredPath(".env")
+}
+
+func normalizeConfiguredPath(input string) (string, error) {
+	path := strings.TrimSpace(input)
+	if path == "" {
+		path = ".env"
+	}
+	if !filepath.IsAbs(path) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(cwd, path)
+	}
+
+	info, err := os.Stat(path)
+	if err == nil && info.IsDir() {
+		path = filepath.Join(path, ".env")
+		info, err = os.Stat(path)
+	}
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("config file not found: %s", path)
+		}
+		return "", err
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("config path must point to a file, got directory: %s", path)
+	}
+	return path, nil
 }
 
 func GetAppVersion() string {
@@ -194,7 +281,20 @@ func GetRuntimeSqlitePath() string {
 	if filepath.IsAbs(filename) {
 		return filename
 	}
-	return filepath.Join(RuntimePath, filename)
+	filename = strings.TrimPrefix(strings.TrimPrefix(filename, "/"), "\\")
+	return filepath.Join(RuntimePath, filepath.FromSlash(filename))
+}
+
+func GetPrimarySqlitePath() string {
+	filename := strings.TrimSpace(viper.GetString("sqlite_database_filename"))
+	if filename == "" {
+		return filepath.Join(configRootPath, "epusdt.db")
+	}
+	if filepath.IsAbs(filename) {
+		return filename
+	}
+	filename = strings.TrimPrefix(strings.TrimPrefix(filename, "/"), "\\")
+	return filepath.Join(configRootPath, filepath.FromSlash(filename))
 }
 
 func GetQueueConcurrency() int {

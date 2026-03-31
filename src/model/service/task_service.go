@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	tron "github.com/assimon/luuu/crypto"
 	"github.com/assimon/luuu/config"
+	tron "github.com/assimon/luuu/crypto"
 	"github.com/assimon/luuu/model/data"
 	"github.com/assimon/luuu/model/mdb"
 	"github.com/assimon/luuu/model/request"
@@ -73,7 +73,14 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 		panic("TRX API response indicates failure")
 	}
 
-	for i, transfer := range gjson.GetBytes(resp.Body(), "data").Array() {
+	transfers := gjson.GetBytes(resp.Body(), "data").Array()
+	if len(transfers) == 0 {
+		log.Sugar.Debugf("[TRX][%s] no transfer records found", address)
+		return
+	}
+	log.Sugar.Debugf("[TRX][%s] fetched %d transfer records", address, len(transfers))
+
+	for i, transfer := range transfers {
 		if transfer.Get("raw_data.contract.0.type").String() != "TransferContract" {
 			continue
 		}
@@ -108,8 +115,10 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 			panic(err)
 		}
 		if tradeID == "" {
+			log.Sugar.Debugf("[TRX][%s] skip unmatched tx hash=%s amount=%.2f", address, txID, amount)
 			continue
 		}
+		log.Sugar.Infof("[TRX][%s] matched trade_id=%s hash=%s amount=%.2f", address, tradeID, txID, amount)
 
 		order, err := data.GetOrderInfoByTradeId(tradeID)
 		if err != nil {
@@ -139,6 +148,7 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 		}
 
 		sendPaymentNotification(order)
+		log.Sugar.Infof("[TRX][%s] payment processed trade_id=%s hash=%s", address, tradeID, txID)
 	}
 }
 
@@ -174,7 +184,14 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 		panic("TRC20 API response indicates failure")
 	}
 
-	for i, transfer := range gjson.GetBytes(resp.Body(), "data").Array() {
+	transfers := gjson.GetBytes(resp.Body(), "data").Array()
+	if len(transfers) == 0 {
+		log.Sugar.Debugf("[TRC20][%s] no transfer records found", address)
+		return
+	}
+	log.Sugar.Debugf("[TRC20][%s] fetched %d transfer records", address, len(transfers))
+
+	for i, transfer := range transfers {
 		if transfer.Get("token_info.address").String() != TRC20_USDT_ID {
 			continue
 		}
@@ -200,8 +217,10 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 			panic(err)
 		}
 		if tradeID == "" {
+			log.Sugar.Debugf("[TRC20][%s] skip unmatched tx hash=%s amount=%.2f", address, txID, amount)
 			continue
 		}
+		log.Sugar.Infof("[TRC20][%s] matched trade_id=%s hash=%s amount=%.2f", address, tradeID, txID, amount)
 
 		order, err := data.GetOrderInfoByTradeId(tradeID)
 		if err != nil {
@@ -231,18 +250,29 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 		}
 
 		sendPaymentNotification(order)
+		log.Sugar.Infof("[TRC20][%s] payment processed trade_id=%s hash=%s", address, tradeID, txID)
 	}
 }
 
 func sendPaymentNotification(order *mdb.Orders) {
 	msg := fmt.Sprintf(
-		"Payment received\nTrade ID: %s\nOrder ID: %s\nOrder Amount: %.2f %s\nReceived Amount: %.2f %s\nAddress: %s\nCreated At: %s\nPaid At: %s",
-		order.TradeId,
-		order.OrderId,
+		"🎉 <b>收款成功通知</b>\n\n"+
+			"💰 <b>金额信息</b>\n"+
+			"├ 订单金额：<code>%.2f %s</code>\n"+
+			"└ 实际到账：<code>%.2f %s</code>\n\n"+
+			"📋 <b>订单信息</b>\n"+
+			"├ 交易号：<code>%s</code>\n"+
+			"├ 订单号：<code>%s</code>\n"+
+			"└ 钱包地址：<code>%s</code>\n\n"+
+			"⏰ <b>时间信息</b>\n"+
+			"├ 创建时间：%s\n"+
+			"└ 支付时间：%s",
 		order.Amount,
 		strings.ToUpper(order.Currency),
 		order.ActualAmount,
 		strings.ToUpper(order.Token),
+		order.TradeId,
+		order.OrderId,
 		order.ReceiveAddress,
 		order.CreatedAt.ToDateTimeString(),
 		carbon.Now().ToDateTimeString(),

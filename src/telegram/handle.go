@@ -2,6 +2,8 @@ package telegram
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/assimon/luuu/model/data"
 	"github.com/assimon/luuu/model/mdb"
@@ -11,25 +13,52 @@ import (
 )
 
 const (
-	ReplayAddWallet = "请发给我一个合法的钱包地址"
+	ReplayAddWallet         = "请发给我一个合法的钱包地址"
+	pendingWalletAddressTTL = 5 * time.Minute
 )
 
+type pendingWalletAddressState struct {
+	RequestedAt time.Time
+}
+
+var pendingWalletAddressUsers sync.Map
+
 func OnTextMessageHandle(c tb.Context) error {
-	if c.Message().ReplyTo.Text == ReplayAddWallet {
-		defer bots.Delete(c.Message().ReplyTo)
-		msgText := c.Message().Text
-		if !isValidTronAddress(msgText) {
-			_ = c.Send(fmt.Sprintf("钱包[%s]添加失败: 非Tron地址！", msgText))
-			return nil
-		}
-		_, err := data.AddWalletAddress(msgText)
-		if err != nil {
-			return c.Send(err.Error())
-		}
-		_ = c.Send(fmt.Sprintf("钱包[%s]添加成功！", msgText))
-		return WalletList(c)
+	msg := c.Message()
+	if msg == nil {
+		return nil
 	}
-	return nil
+
+	sender := c.Sender()
+	senderID := int64(0)
+	if sender != nil {
+		senderID = sender.ID
+	}
+
+	isReplyFlow := msg.ReplyTo != nil && msg.ReplyTo.Text == ReplayAddWallet
+	isPendingFlow := isWalletAddressPending(senderID)
+	if !isReplyFlow && !isPendingFlow {
+		return nil
+	}
+
+	if isReplyFlow {
+		defer bots.Delete(msg.ReplyTo)
+	}
+
+	msgText := msg.Text
+	if !isValidTronAddress(msgText) {
+		_ = c.Send(fmt.Sprintf("钱包 [%s] 添加失败：不是合法的 TRON 地址", msgText))
+		return nil
+	}
+
+	_, err := data.AddWalletAddress(msgText)
+	if err != nil {
+		return c.Send(err.Error())
+	}
+	pendingWalletAddressUsers.Delete(senderID)
+
+	_ = c.Send(fmt.Sprintf("钱包 [%s] 添加成功", msgText))
+	return WalletList(c)
 }
 
 func WalletList(c tb.Context) error {
@@ -37,29 +66,35 @@ func WalletList(c tb.Context) error {
 	if err != nil {
 		return err
 	}
+
 	var btnList [][]tb.InlineButton
 	for _, wallet := range wallets {
 		status := "已启用✅"
 		if wallet.Status == mdb.TokenStatusDisable {
 			status = "已禁用🚫"
 		}
-		var temp []tb.InlineButton
+
 		btnInfo := tb.InlineButton{
 			Unique: wallet.Address,
-			Text:   fmt.Sprintf("%s[%s]", wallet.Address, status),
+			Text:   fmt.Sprintf("%s [%s]", wallet.Address, status),
 			Data:   strutil.MustString(wallet.ID),
 		}
 		bots.Handle(&btnInfo, WalletInfo)
-		btnList = append(btnList, append(temp, btnInfo))
+		btnList = append(btnList, []tb.InlineButton{btnInfo})
 	}
+
 	addBtn := tb.InlineButton{Text: "添加钱包地址", Unique: "AddWallet"}
 	bots.Handle(&addBtn, func(c tb.Context) error {
+		if sender := c.Sender(); sender != nil {
+			pendingWalletAddressUsers.Store(sender.ID, pendingWalletAddressState{RequestedAt: time.Now()})
+		}
 		return c.Send(ReplayAddWallet, &tb.ReplyMarkup{
 			ForceReply: true,
 		})
 	})
 	btnList = append(btnList, []tb.InlineButton{addBtn})
-	return c.EditOrSend("请点击钱包继续操作", &tb.ReplyMarkup{
+
+	return c.EditOrSend("请选择钱包继续操作", &tb.ReplyMarkup{
 		InlineKeyboard: btnList,
 	})
 }
@@ -70,6 +105,7 @@ func WalletInfo(c tb.Context) error {
 	if err != nil {
 		return c.Send(err.Error())
 	}
+
 	enableBtn := tb.InlineButton{
 		Text:   "启用",
 		Unique: "enableBtn",
@@ -89,10 +125,12 @@ func WalletInfo(c tb.Context) error {
 		Text:   "返回",
 		Unique: "WalletList",
 	}
+
 	bots.Handle(&enableBtn, EnableWallet)
 	bots.Handle(&disableBtn, DisableWallet)
 	bots.Handle(&delBtn, DelWallet)
 	bots.Handle(&backBtn, WalletList)
+
 	return c.EditOrReply(tokenInfo.Address, &tb.ReplyMarkup{InlineKeyboard: [][]tb.InlineButton{
 		{
 			enableBtn,
@@ -139,4 +177,21 @@ func DelWallet(c tb.Context) error {
 		return c.Send(err.Error())
 	}
 	return WalletList(c)
+}
+
+func isWalletAddressPending(userID int64) bool {
+	if userID <= 0 {
+		return false
+	}
+	value, ok := pendingWalletAddressUsers.Load(userID)
+	if !ok {
+		return false
+	}
+
+	state, ok := value.(pendingWalletAddressState)
+	if !ok || time.Since(state.RequestedAt) > pendingWalletAddressTTL {
+		pendingWalletAddressUsers.Delete(userID)
+		return false
+	}
+	return true
 }

@@ -185,6 +185,78 @@ func TestDispatchPendingCallbacksHonorsBackoffAndPersistsSuccess(t *testing.T) {
 	}
 }
 
+func TestDispatchPendingCallbacksResumesRetryAfterRestart(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := atomic.AddInt32(&requestCount, 1)
+		if attempt == 1 {
+			http.Error(w, "retry later", http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:            "trade_callback_restart",
+		OrderId:            "order_callback_restart",
+		Amount:             1,
+		Currency:           "CNY",
+		ActualAmount:       1,
+		ReceiveAddress:     "wallet_restart",
+		Token:              "USDT",
+		Status:             mdb.StatusPaySuccess,
+		NotifyUrl:          server.URL,
+		BlockTransactionId: "block_callback_restart",
+		CallbackNum:        0,
+		CallBackConfirm:    mdb.CallBackConfirmNo,
+	}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatalf("create callback order: %v", err)
+	}
+
+	dispatchPendingCallbacks()
+
+	waitFor(t, 3*time.Second, func() bool {
+		current, err := data.GetOrderInfoByTradeId(order.TradeId)
+		if err != nil || current.ID <= 0 {
+			return false
+		}
+		return current.CallBackConfirm == mdb.CallBackConfirmNo && current.CallbackNum == 1
+	})
+
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("first callback request count = %d, want 1", got)
+	}
+
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+
+	if err := dao.Mdb.Model(order).UpdateColumn("updated_at", time.Now().Add(-2*time.Second)).Error; err != nil {
+		t.Fatalf("age callback order for retry: %v", err)
+	}
+
+	dispatchPendingCallbacks()
+
+	waitFor(t, 3*time.Second, func() bool {
+		current, err := data.GetOrderInfoByTradeId(order.TradeId)
+		if err != nil || current.ID <= 0 {
+			return false
+		}
+		return current.CallBackConfirm == mdb.CallBackConfirmOk && current.CallbackNum == 2
+	})
+
+	if got := atomic.LoadInt32(&requestCount); got != 2 {
+		t.Fatalf("total callback request count = %d, want 2", got)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 	t.Helper()
 

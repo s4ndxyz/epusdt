@@ -8,12 +8,20 @@ import (
 	"github.com/assimon/luuu/model/dao"
 	"github.com/assimon/luuu/model/mdb"
 	"github.com/assimon/luuu/model/request"
+	"github.com/dromara/carbon/v2"
 	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 var ErrTransactionLocked = errors.New("transaction amount is already locked")
+
+type PendingCallbackOrder struct {
+	TradeId         string      `gorm:"column:trade_id"`
+	CallbackNum     int         `gorm:"column:callback_num"`
+	CallBackConfirm int         `gorm:"column:callback_confirm"`
+	UpdatedAt       carbon.Time `gorm:"column:updated_at"`
+}
 
 func normalizeLockAmount(amount float64) (int64, string) {
 	value := decimal.NewFromFloat(amount).Round(2)
@@ -63,10 +71,11 @@ func OrderSuccessWithTransaction(tx *gorm.DB, req *request.OrderProcessingReques
 	return result.RowsAffected > 0, result.Error
 }
 
-// GetPendingCallbackOrders returns orders that still need callback delivery.
-func GetPendingCallbackOrders(maxRetry int, limit int) ([]mdb.Orders, error) {
-	var orders []mdb.Orders
+// GetPendingCallbackOrders returns the minimal callback scheduling state.
+func GetPendingCallbackOrders(maxRetry int, limit int) ([]PendingCallbackOrder, error) {
+	var orders []PendingCallbackOrder
 	query := dao.Mdb.Model(&mdb.Orders{}).
+		Select("trade_id", "callback_num", "callback_confirm", "updated_at").
 		Where("callback_num <= ?", maxRetry).
 		Where("callback_confirm = ?", mdb.CallBackConfirmNo).
 		Where("status = ?", mdb.StatusPaySuccess).

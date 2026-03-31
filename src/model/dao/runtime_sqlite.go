@@ -27,12 +27,6 @@ func RuntimeInit() error {
 		return err
 	}
 
-	sqlDB, err := RuntimeDB.DB()
-	if err != nil {
-		color.Red.Printf("[runtime_db] sqlite get DB,err=%s\n", err)
-		return err
-	}
-
 	concurrency := config.GetQueueConcurrency()
 	if concurrency < 2 {
 		concurrency = 2
@@ -40,19 +34,7 @@ func RuntimeInit() error {
 	if concurrency > 16 {
 		concurrency = 16
 	}
-	sqlDB.SetMaxOpenConns(concurrency)
-	sqlDB.SetMaxIdleConns(1)
-
-	if err = RuntimeDB.Exec("PRAGMA journal_mode=WAL;").Error; err != nil {
-		return err
-	}
-	if err = RuntimeDB.Exec("PRAGMA synchronous=NORMAL;").Error; err != nil {
-		return err
-	}
-	if err = RuntimeDB.Exec("PRAGMA busy_timeout=5000;").Error; err != nil {
-		return err
-	}
-	if err = sqlDB.Ping(); err != nil {
+	if _, err = configureSQLite(RuntimeDB, concurrency); err != nil {
 		color.Red.Printf("[runtime_db] sqlite connDB err:%s", err.Error())
 		return err
 	}

@@ -3,6 +3,7 @@ package mq
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/assimon/luuu/config"
@@ -16,6 +17,16 @@ import (
 )
 
 const batchSize = 100
+
+const sqliteBusyRetryAttempts = 3
+
+type expirableOrder struct {
+	ID             uint64  `gorm:"column:id"`
+	TradeId        string  `gorm:"column:trade_id"`
+	ReceiveAddress string  `gorm:"column:receive_address"`
+	Token          string  `gorm:"column:token"`
+	ActualAmount   float64 `gorm:"column:actual_amount"`
+}
 
 func runOrderExpirationLoop() {
 	runLoop("order_expiration", processExpiredOrders)
@@ -51,13 +62,16 @@ func safeRun(name string, fn func()) {
 func processExpiredOrders() {
 	expirationCutoff := time.Now().Add(-config.GetOrderExpirationTimeDuration())
 	for {
-		var orders []mdb.Orders
-		err := dao.Mdb.Model(&mdb.Orders{}).
-			Where("status = ?", mdb.StatusWaitPay).
-			Where("created_at <= ?", expirationCutoff).
-			Order("id asc").
-			Limit(batchSize).
-			Find(&orders).Error
+		var orders []expirableOrder
+		err := withSQLiteBusyRetry(func() error {
+			return dao.Mdb.Model(&mdb.Orders{}).
+				Select("id", "trade_id", "receive_address", "token", "actual_amount").
+				Where("status = ?", mdb.StatusWaitPay).
+				Where("created_at <= ?", expirationCutoff).
+				Order("id asc").
+				Limit(batchSize).
+				Find(&orders).Error
+		})
 		if err != nil {
 			log.Sugar.Errorf("[mq] query expired orders failed: %v", err)
 			return
@@ -88,7 +102,12 @@ func processExpiredOrders() {
 
 func dispatchPendingCallbacks() {
 	maxRetry := config.GetOrderNoticeMaxRetry()
-	orders, err := data.GetPendingCallbackOrders(maxRetry, batchSize)
+	var orders []data.PendingCallbackOrder
+	err := withSQLiteBusyRetry(func() error {
+		var innerErr error
+		orders, innerErr = data.GetPendingCallbackOrders(maxRetry, batchSize)
+		return innerErr
+	})
 	if err != nil {
 		log.Sugar.Errorf("[mq] query callback orders failed: %v", err)
 		return
@@ -99,29 +118,30 @@ func dispatchPendingCallbacks() {
 		if !isCallbackDue(&order, now, maxRetry) {
 			continue
 		}
-		if _, loaded := callbackInflight.LoadOrStore(order.TradeId, struct{}{}); loaded {
+		tradeID := order.TradeId
+		if _, loaded := callbackInflight.LoadOrStore(tradeID, struct{}{}); loaded {
 			continue
 		}
 
 		select {
 		case callbackLimiter <- struct{}{}:
-			go processCallback(order)
+			go processCallback(tradeID)
 		default:
-			callbackInflight.Delete(order.TradeId)
+			callbackInflight.Delete(tradeID)
 			return
 		}
 	}
 }
 
-func processCallback(order mdb.Orders) {
+func processCallback(tradeID string) {
 	defer func() {
 		<-callbackLimiter
-		callbackInflight.Delete(order.TradeId)
+		callbackInflight.Delete(tradeID)
 	}()
 
-	freshOrder, err := data.GetOrderInfoByTradeId(order.TradeId)
+	freshOrder, err := data.GetOrderInfoByTradeId(tradeID)
 	if err != nil {
-		log.Sugar.Errorf("[mq] reload callback order failed, trade_id=%s, err=%v", order.TradeId, err)
+		log.Sugar.Errorf("[mq] reload callback order failed, trade_id=%s, err=%v", tradeID, err)
 		return
 	}
 	if freshOrder.ID <= 0 || freshOrder.Status != mdb.StatusPaySuccess || freshOrder.CallBackConfirm != mdb.CallBackConfirmNo {
@@ -180,7 +200,30 @@ func cleanupExpiredTransactionLocks() {
 	}
 }
 
-func isCallbackDue(order *mdb.Orders, now time.Time, maxRetry int) bool {
+func withSQLiteBusyRetry(fn func() error) error {
+	var err error
+	for attempt := 1; attempt <= sqliteBusyRetryAttempts; attempt++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if !isSQLiteBusyError(err) || attempt == sqliteBusyRetryAttempts {
+			return err
+		}
+		time.Sleep(time.Duration(attempt*25) * time.Millisecond)
+	}
+	return err
+}
+
+func isSQLiteBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "sqlite_busy")
+}
+
+func isCallbackDue(order *data.PendingCallbackOrder, now time.Time, maxRetry int) bool {
 	if order.CallBackConfirm != mdb.CallBackConfirmNo {
 		return false
 	}
