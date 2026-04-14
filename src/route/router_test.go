@@ -322,6 +322,17 @@ func TestSupportedAssetCRUD(t *testing.T) {
 	if resp["status_code"].(float64) != 200 {
 		t.Fatalf("delete supported asset failed: %v", resp)
 	}
+
+	// recreate after delete should restore soft-deleted row, not unique-conflict
+	rec = doPostWithToken(e, "/payments/gmpay/v1/supported-assets/add", map[string]interface{}{
+		"network": "arbitrum",
+		"token":   "usdc",
+		"status":  1,
+	})
+	resp = parseResp(t, rec)
+	if resp["status_code"].(float64) != 200 {
+		t.Fatalf("recreate after delete failed: %v", resp)
+	}
 }
 
 // TestWalletAddAndList tests adding wallets via API and listing them.

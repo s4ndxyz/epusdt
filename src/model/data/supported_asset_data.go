@@ -21,12 +21,36 @@ func AddSupportedAsset(network, token string, status int64) (*mdb.SupportedAsset
 	if exist.ID > 0 {
 		return nil, constant.SupportedAssetAlreadyExists
 	}
+
+	deleted, err := getSupportedAssetByNetworkAndTokenUnscoped(network, token)
+	if err != nil {
+		return nil, err
+	}
+	if deleted.ID > 0 && deleted.DeletedAt.Valid {
+		deleted.Status = status
+		deleted.DeletedAt.Valid = false
+		if err := dao.Mdb.Unscoped().Save(deleted).Error; err != nil {
+			return nil, err
+		}
+		return deleted, nil
+	}
+
 	asset := &mdb.SupportedAsset{
 		Network: network,
 		Token:   token,
 		Status:  status,
 	}
 	err = dao.Mdb.Create(asset).Error
+	return asset, err
+}
+
+func getSupportedAssetByNetworkAndTokenUnscoped(network, token string) (*mdb.SupportedAsset, error) {
+	network, token = normalizeNetworkToken(network, token)
+	asset := new(mdb.SupportedAsset)
+	err := dao.Mdb.Unscoped().Model(asset).
+		Where("network = ?", network).
+		Where("token = ?", token).
+		Limit(1).Find(asset).Error
 	return asset, err
 }
 
