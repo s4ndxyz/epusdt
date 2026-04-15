@@ -13,10 +13,25 @@ func AddWalletAddress(address string) (*mdb.WalletAddress, error) {
 	return AddWalletAddressWithNetwork(mdb.NetworkTron, address)
 }
 
+// isEVMNetwork 判断是否是 EVM 网络
+func isEVMNetwork(network string) bool {
+	switch network {
+	case mdb.NetworkEthereum, mdb.NetworkBsc, mdb.NetworkPolygon, mdb.NetworkPlasma:
+		return true
+	}
+	return false
+}
+
 // AddWalletAddressWithNetwork 创建指定网络的钱包地址
 func AddWalletAddressWithNetwork(network, address string) (*mdb.WalletAddress, error) {
 	network = strings.ToLower(strings.TrimSpace(network))
 	address = strings.TrimSpace(address)
+
+	// evm 网络地址统一小写，tron 和 solana 保持原样
+	if isEVMNetwork(network) {
+		address = strings.ToLower(address)
+	}
+
 	exist, err := GetWalletAddressByNetworkAndAddress(network, address)
 	if err != nil {
 		return nil, err

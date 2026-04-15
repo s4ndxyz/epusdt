@@ -50,7 +50,7 @@ func StartPolygonWebSocketListener() {
 			storePolygonRecipientsFromWallets(w)
 		}
 	}()
-	wsURL := "wss://polygon-bor-ws.publicnode.com"
+	wsURL := "wss://polygon-bor-rpc.publicnode.com"
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{
 			polygonUsdtContract,

@@ -1,10 +1,11 @@
 /* =============================================================
  *  GM Pay — payment.js
  *  后端对接只需关注:
- *    1. CONFIG.api.selectMethod — Step 1 确认接口（POST 币种/网络，返回收款地址）
- *    2. CONFIG.api.checkStatus  — 轮询接口 URL
- *    3. CONFIG.api.statusMap    — 状态码映射
- *    4. index.html 底部 <script> 中 ORDER / PAYMENT_OPTIONS 变量
+ *    1. CONFIG.api.supportedAssets — 获取支持的网络和币种
+ *    2. CONFIG.api.selectMethod    — Step 1 确认接口（POST 币种/网络，返回收款地址）
+ *    3. CONFIG.api.checkStatus     — 轮询接口 URL
+ *    4. CONFIG.api.statusMap       — 状态码映射
+ *    5. index.html 底部 <script> 中 ORDER 变量
  * ============================================================= */
 
 'use strict';
@@ -23,6 +24,78 @@ const setHtml = (id, value) => {
   return el;
 };
 
+// ── API 错误码映射 ────────────────────────────────────────────
+const API_ERRORS = {
+  400:   { en: 'System error',                             zh: '系统错误',               'zh-hk': '系統錯誤',              ja: 'システムエラー',                        ko: '시스템 오류',                  ru: 'Системная ошибка' },
+  401:   { en: 'Signature / authentication failed',        zh: '签名/认证失败',           'zh-hk': '簽名/認證失敗',          ja: '署名/認証に失敗しました',               ko: '서명/인증 실패',               ru: 'Ошибка подписи / аутентификации' },
+  10001: { en: 'Wallet address already exists',            zh: '钱包地址已存在',          'zh-hk': '錢包地址已存在',         ja: 'ウォレットアドレスが既に存在します',    ko: '지갑 주소가 이미 존재합니다',  ru: 'Адрес кошелька уже существует' },
+  10002: { en: 'Order already exists',                     zh: '订单已存在',              'zh-hk': '訂單已存在',             ja: '注文が既に存在します',                  ko: '주문이 이미 존재합니다',       ru: 'Заказ уже существует' },
+  10003: { en: 'No wallet address available',              zh: '无可用钱包地址',          'zh-hk': '無可用錢包地址',         ja: '利用可能なウォレットアドレスがありません', ko: '사용 가능한 지갑 주소 없음', ru: 'Нет доступного адреса кошелька' },
+  10004: { en: 'Invalid payment amount',                   zh: '无效支付金额',            'zh-hk': '無效支付金額',           ja: '無効な支払い金額',                      ko: '유효하지 않은 결제 금액',      ru: 'Недопустимая сумма платежа' },
+  10005: { en: 'No available amount channel',              zh: '无可用金额通道',          'zh-hk': '無可用金額通道',         ja: '利用可能な金額チャンネルがありません',  ko: '사용 가능한 금액 채널 없음',   ru: 'Нет доступного канала суммы' },
+  10006: { en: 'Exchange rate calculation failed',         zh: '汇率计算失败',            'zh-hk': '匯率計算失敗',           ja: '為替レート計算に失敗しました',          ko: '환율 계산 실패',               ru: 'Ошибка расчёта курса' },
+  10007: { en: 'Block transaction already processed',      zh: '区块交易已处理',          'zh-hk': '區塊交易已處理',         ja: 'ブロックトランザクションは処理済みです', ko: '블록 트랜잭션이 이미 처리됨', ru: 'Транзакция блока уже обработана' },
+  10008: { en: 'Order not found',                          zh: '订单不存在',              'zh-hk': '訂單不存在',             ja: '注文が見つかりません',                  ko: '주문 없음',                    ru: 'Заказ не найден' },
+  10009: { en: 'Request parameter parsing failed',         zh: '请求参数解析失败',        'zh-hk': '請求參數解析失敗',       ja: 'リクエストパラメータの解析に失敗',      ko: '요청 매개변수 파싱 실패',      ru: 'Ошибка разбора параметров запроса' },
+  10010: { en: 'Order status has changed',                 zh: '订单状态已变更',          'zh-hk': '訂單狀態已變更',         ja: '注文ステータスが変更されました',        ko: '주문 상태가 변경됨',           ru: 'Статус заказа изменился' },
+  10011: { en: 'Sub-order quantity exceeded',              zh: '子订单数量超限',          'zh-hk': '子訂單數量超限',         ja: 'サブ注文数が超過しました',              ko: '하위 주문 수량 초과',          ru: 'Превышено количество подзаказов' },
+  10012: { en: 'Cannot switch network for sub-orders',     zh: '不能对子订单切换网络',    'zh-hk': '不能對子訂單切換網絡',   ja: 'サブ注文のネットワーク切替不可',        ko: '하위 주문에 네트워크 전환 불가', ru: 'Нельзя переключить сеть для подзаказов' },
+  10013: { en: 'Order is not in pending payment status',   zh: '订单不是待支付状态',      'zh-hk': '訂單不是待支付狀態',     ja: '注文は支払い待ち状態ではありません',    ko: '주문이 결제 대기 상태가 아님', ru: 'Заказ не в статусе ожидания оплаты' },
+};
+
+/**
+ * 根据 API 错误码返回当前语言的提示文字；未匹配时返回 null
+ * @param {number|string|null|undefined} code
+ * @returns {string|null}
+ */
+function getApiErrorMsg(code) {
+  if (code == null) return null;
+  const map = API_ERRORS[Number(code)];
+  if (!map) return null;
+  return map[currentLang] ?? map.en;
+}
+
+/** API 业务异常（区别于网络异常），携带错误码 */
+class ApiError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+/** 错误码 → 终态面板映射；命中即跳转面板，不弹 toast */
+const _TERMINAL_ERROR_CODES = {
+  10008: 'not-found',   // 订单不存在
+  10010: 'expired',     // 订单状态已变更
+  10013: 'not-found',   // 订单不是待支付状态
+};
+
+/**
+ * 统一 API 请求：发送 → 解析 JSON → 校验业务码 → 返回 data
+ * 业务异常抛 ApiError，网络/超时异常原样冒泡
+ */
+async function apiFetch(url, opts = {}) {
+  const { timeout = 10000, ...fetchOpts } = opts;
+  fetchOpts.headers = { Accept: 'application/json', ...fetchOpts.headers };
+  if (!fetchOpts.signal) fetchOpts.signal = AbortSignal.timeout(timeout);
+  const res  = await fetch(url, fetchOpts);
+  const resp = await res.json().catch(() => null);
+  if (!res.ok || (resp?.code != null && resp.code !== 200)) {
+    const code = resp?.code ? Number(resp.code) : res.status;
+    throw new ApiError(code, getApiErrorMsg(code) ?? resp?.msg ?? `HTTP ${res.status}`);
+  }
+  return resp?.data ?? resp;
+}
+
+/**
+ * 统一处理 API 异常：终态错误码 → 跳转面板；其余 → 弹 toast
+ * @returns {boolean} true = 终态，已跳转面板
+ */
+function handleApiError(err) {
+  const panel = (err instanceof ApiError) && _TERMINAL_ERROR_CODES[err.code];
+  if (panel) { _enterTerminalState(panel); return true; }
+  console.error('[API]', err);
+  showToast('⚠ ' + (err.message || t('network_timeout')));
+  return false;
+}
+
 // ── 全局配置（可按项目调整）─────────────────────────────────
 const CONFIG = {
   poll: {
@@ -35,6 +108,8 @@ const CONFIG = {
   },
   // ---- 后端接口 ----
   api: {
+    // 获取支持的网络和币种
+    supportedAssets: () => '/payments/gmpay/v1/supported-assets',
     // 切换网络接口：POST { trade_id, token, network }，返回完整订单对象
     selectMethod: () => '/pay/switch-network',
     // 轮询接口：GET，返回 { data: { status: number } }
@@ -98,8 +173,7 @@ const _CHAIN_ALIASES = {
 
 const IMAGE_PREFIX = {
   chain: '/static/images/',
-  tokenTrigger: 'https://cdn.jsdmirror.com/gh/atomiclabs/cryptocurrency-icons@1a63530/128/color/',
-  tokenMenu: 'https://cdn.jsdmirror.com/gh/atomiclabs/cryptocurrency-icons@1a63530/128/color/',
+  token: 'https://cdn.jsdmirror.com/gh/atomiclabs/cryptocurrency-icons@1a63530/128/color/',
 };
 
 function _resolveChain(name) {
@@ -132,7 +206,7 @@ function _networkTriggerHtml(network) {
 /** 选择器触发器显示：Token */
 function _tokenTriggerHtml(token) {
   if (!token) return `<span class="text-sm font-semibold" style="color:var(--card-foreground)">--</span>`;
-  const src = `${IMAGE_PREFIX.tokenTrigger}${token.toLowerCase()}.png`;
+  const src = `${IMAGE_PREFIX.token}${token.toLowerCase()}.png`;
   return `<span style="display:inline-flex;align-items:center;gap:7px">
     <img src="${src}" width="18" height="18" style="width:18px;height:18px;border-radius:50%;object-fit:cover;flex-shrink:0" onerror="this.style.display='none'" />
     <span class="text-sm font-semibold" style="color:var(--card-foreground)">${token}</span>
@@ -164,8 +238,8 @@ function applyTheme(t) {
   currentTheme = t;
   document.documentElement.setAttribute('data-theme', t);
   localStorage.setItem('theme', t);
-  $('icon-moon').style.display = t === 'light' ? 'block' : 'none';
-  $('icon-sun').style.display  = t === 'dark'  ? 'block' : 'none';
+  const moon = $('icon-moon'); if (moon) moon.style.display = t === 'light' ? 'block' : 'none';
+  const sun  = $('icon-sun');  if (sun)  sun.style.display  = t === 'dark'  ? 'block' : 'none';
 }
 
 function toggleTheme(e) {
@@ -385,10 +459,7 @@ function setLang(lang) {
     o.classList.toggle('is-selected', o.dataset.lang === lang));
   closeAllSelects();
   // 重新渲染含翻译文案的动态行
-  if (ORDER?.tradeId) renderOrderId();
-  if (ORDER?.amount && !ORDER.amount.startsWith('{{')) {
-    renderRow('display-fiat', t('order_amount'), `${ORDER.amount} ${ORDER.currency || ''}`);
-  }
+  renderOrderCard();
 }
 
 
@@ -538,8 +609,6 @@ function goBack() {
   }
 }
 
-function syncStatusCardHeight() {} // 兼容旧调用，保留空桩
-
 
 // ═══════════════════════════════════════════════════════════════
 //  SECTION 7 — 步骤进度条
@@ -564,22 +633,26 @@ function setStepBar(step) {
 //  SECTION 8 — Step 1 — 币种 & 网络选择
 // ═══════════════════════════════════════════════════════════════
 
+/**
+ * 从后端获取支持的网络和币种，转换为 PAYMENT_OPTIONS 格式
+ * @returns {Array|null} 成功返回选项数组，失败返回 null
+ */
+async function fetchSupportedAssets() {
+  try {
+    const data = await apiFetch(CONFIG.api.supportedAssets());
+    if (!data?.supports?.length) return null;
+    return data.supports.flatMap(s => s.tokens.map(token => ({ token, network: s.network })));
+  } catch (e) {
+    console.warn('[supportedAssets]', e);
+    return null;
+  }
+}
+
 let _step1Token = null;
 let _step1Opt   = null;
 
-// 内置优先网络，按顺序匹配第一个可用选项
-const _PREFERRED_NETWORKS = ['TRON', 'Solana'];
-
 function initStep1() {
-  // 按内置优先顺序找到首个可用选项
-  _step1Opt = null;
-  for (const net of _PREFERRED_NETWORKS) {
-    _step1Opt = PAYMENT_OPTIONS.find(
-      o => (_resolveChain(o.network)?.label ?? o.network) === net
-    );
-    if (_step1Opt) break;
-  }
-  _step1Opt   = _step1Opt ?? PAYMENT_OPTIONS[0];
+  _step1Opt   = PAYMENT_OPTIONS[0];
   _step1Token = _step1Opt.token;
   _renderNetworkMenu();
   _renderTokenMenu();
@@ -597,7 +670,7 @@ function _renderTokenMenu() {
   const menu = $('dd-token-menu');
   if (!menu) return;
   menu.innerHTML = tokens.map(tok => {
-    const src = `${IMAGE_PREFIX.tokenMenu}${tok.toLowerCase()}.png`;
+    const src = `${IMAGE_PREFIX.token}${tok.toLowerCase()}.png`;
     return `<div class="select-option menu-item${tok === _step1Token ? ' is-selected' : ''}"
       onclick="step1SetToken('${tok}')"
       style="display:flex;align-items:center;gap:8px">
@@ -643,8 +716,28 @@ function step1SetNetwork(networkName) {
   closeAllSelects();
 }
 
+/** 用后端返回的订单字段更新 ORDER */
+function _applyOrderData(data, opt) {
+  ORDER.tradeId = data?.trade_id ?? ORDER.tradeId;
+  if (data?.trade_id) {
+    const _url = new URL(window.location.href);
+    _url.pathname = _url.pathname.replace(/\/[^/]+$/, '/' + encodeURIComponent(data.trade_id));
+    history.replaceState(null, '', _url.toString());
+    renderOrderCard();
+  }
+  ORDER.token          = data?.token           ?? opt.token;
+  ORDER.network        = data?.network         ?? opt.network;
+  ORDER.actualAmount   = data?.actual_amount   != null ? String(data.actual_amount) : ORDER.actualAmount;
+  ORDER.amount         = data?.amount          != null ? String(data.amount)         : ORDER.amount;
+  ORDER.currency       = data?.currency        ?? ORDER.currency;
+  ORDER.receiveAddress = data?.receive_address ?? ORDER.receiveAddress;
+  if (data?.expiration_time != null) ORDER.expirationTime = String(data.expiration_time);
+  if (data?.created_at      != null) ORDER.createdAt      = String(data.created_at);
+  if (data?.redirect_url)            ORDER.redirectUrl    = data.redirect_url;
+}
+
 async function confirmStep1() {
-  const opt = _step1Opt || PAYMENT_OPTIONS[0];
+  const opt = _step1Opt;
   const btn  = $('btn-confirm-step1');
   const span = btn?.querySelector('span') ?? btn;
   const origText = span?.textContent;
@@ -653,45 +746,22 @@ async function confirmStep1() {
   if (btn) { btn.disabled = true; if (span) span.textContent = '…'; }
 
   try {
-    const res = await fetch(CONFIG.api.selectMethod(), {
+    const data = await apiFetch(CONFIG.api.selectMethod(), {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({
         trade_id: ORDER.tradeId,
         token:    opt.token.toLowerCase(),
         network:  opt.network.toLowerCase(),
       }),
-      signal:  AbortSignal.timeout(10000),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const resp = await res.json();
-    const data = resp?.data ?? resp;
 
-    // 2. 用后端返回的完整订单字段更新 ORDER，本地选项作为兜底
-    ORDER.tradeId        = data?.trade_id        ?? ORDER.tradeId;
-    // 同步新 trade_id 到 URL（路径末段），轮询将自动使用最新值
-    if (data?.trade_id) {
-      const _url = new URL(window.location.href);
-      _url.pathname = _url.pathname.replace(/\/[^/]+$/, '/' + encodeURIComponent(data.trade_id));
-      history.replaceState(null, '', _url.toString());
-      renderOrderId();
-    }
-    ORDER.token          = data?.token           ?? opt.token;
-    ORDER.network        = data?.network         ?? opt.network;
-    ORDER.actualAmount   = data?.actual_amount   != null ? String(data.actual_amount) : opt.actualAmount;
-    ORDER.amount         = data?.amount          != null ? String(data.amount)         : ORDER.amount;
-    ORDER.currency       = data?.currency        ?? ORDER.currency;
-    ORDER.receiveAddress = data?.receive_address ?? opt.receiveAddress;
-    if (data?.expiration_time != null) ORDER.expirationTime = String(data.expiration_time);
-    if (data?.created_at      != null) ORDER.createdAt      = String(data.created_at);
-    if (data?.redirect_url)            ORDER.redirectUrl    = data.redirect_url;
-
+    _applyOrderData(data, opt);
     setStepBar(2);
     slideTo('payment');
     initOrder();
   } catch (err) {
-    console.error('[confirmStep1]', err);
-    showToast('⚠ ' + (err.message || 'Request failed'));
+    handleApiError(err);
   } finally {
     if (btn) { btn.disabled = false; if (span && origText) span.textContent = origText; }
   }
@@ -701,10 +771,6 @@ async function confirmStep1() {
 // ═══════════════════════════════════════════════════════════════
 //  SECTION 9 — 订单渲染 & 倒计时
 // ═══════════════════════════════════════════════════════════════
-
-function truncateAddr(addr) {
-  return addr && addr.length > 10 ? `${addr.slice(0, 4)}...${addr.slice(-6)}` : addr;
-}
 
 function formatAddr(addr) {
   if (!addr || addr.length <= 10) return addr;
@@ -720,9 +786,13 @@ function renderRow(id, label, value) {
     <td style="color:var(--card-foreground);font-weight:500;word-break:break-all">${value}</td>`;
 }
 
-function renderOrderId() {
+/** 填充订单信息卡片（订单号 + 法币金额行） */
+function renderOrderCard() {
   if (ORDER?.tradeId && !ORDER.tradeId.startsWith('{{')) {
     renderRow('display-order-id', t('order_id'), ORDER.tradeId);
+  }
+  if (ORDER?.amount && !ORDER.amount.startsWith('{{')) {
+    renderRow('display-fiat', t('order_amount'), `${ORDER.amount} ${ORDER.currency || ''}`);
   }
 }
 
@@ -732,14 +802,11 @@ function initOrder() {
   setText('display-amount', `${ORDER.actualAmount} ${ORDER.token}`);
   setHtml('field-address', formatAddr(ORDER.receiveAddress));
   setHtml('display-network', networkTag(ORDER.network));
-
-  if (ORDER.amount && !ORDER.amount.startsWith('{{')) {
-    renderRow('display-fiat', t('order_amount'), `${ORDER.amount} ${ORDER.currency || ''}`);
-  }
-  renderOrderId();
+  renderOrderCard();
 
   const qrcodeEl = $('qrcode');
   if (qrcodeEl) {
+    qrcodeEl.innerHTML = ''; // 防止重复调用时叠加渲染
     new QRCode(qrcodeEl, {
       text:         ORDER.receiveAddress,
       width:        176,
@@ -772,6 +839,8 @@ function _ratioColor(ratio) {
 }
 
 function initCountdown() {
+  // 清除上一次的倒计时（initOrder 可能被重复调用）
+  if (_countdownInterval) { clearInterval(_countdownInterval); _countdownInterval = null; }
   const parseTime = (raw) => new Date(/^\d+$/.test(String(raw)) ? Number(raw) : raw);
   _expiresAt = parseTime(ORDER.expirationTime);
   const remaining = Math.max(0, Math.round((_expiresAt - Date.now()) / 1000));
@@ -797,10 +866,10 @@ function _tickCountdown() {
   const color   = _ratioColor(_totalSeconds > 0 ? remaining / _totalSeconds : 0);
   const offset  = CIRCUMFERENCE * (1 - (_totalSeconds > 0 ? remaining / _totalSeconds : 0));
 
-  $('countdown').textContent        = timeStr;
-  $('countdown').style.color        = color;
-  $('ring').style.stroke            = color;
-  $('ring').style.strokeDashoffset  = offset;
+  const cdEl   = $('countdown');
+  const ringEl = $('ring');
+  if (cdEl)   { cdEl.textContent = timeStr; cdEl.style.color = color; }
+  if (ringEl) { ringEl.style.stroke = color; ringEl.style.strokeDashoffset = offset; }
 
   const inlineEl = $('countdown-inline');
   if (inlineEl) { inlineEl.textContent = timeStr; inlineEl.style.color = color; }
@@ -818,28 +887,28 @@ let _pollTimer   = null;
 let _pollStopped = false;
 let _pollErrors  = 0;
 
-function checkOrderStatus() {
+async function checkOrderStatus() {
   if (_pollStopped || !ORDER?.tradeId || ORDER.tradeId.startsWith('{{')) return;
 
-  fetch(CONFIG.api.checkStatus(ORDER.tradeId), {
-    headers: { Accept: 'application/json' },
-    signal:  AbortSignal.timeout(CONFIG.poll.timeout),
-  })
-    .then(res => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.json();
-    })
-    .then(({ data }) => {
+  try {
+    const data = await apiFetch(CONFIG.api.checkStatus(ORDER.tradeId), {
+      timeout: CONFIG.poll.timeout,
+    });
+    _pollErrors = 0;
+    const { paid, expired } = CONFIG.api.statusMap;
+    if (data?.status === paid)         onPaymentSuccess();
+    else if (data?.status === expired) showExpired();
+    else                               _scheduleNextPoll();
+  } catch (err) {
+    if (err instanceof ApiError) {
       _pollErrors = 0;
-      const { paid, expired } = CONFIG.api.statusMap;
-      if (data?.status === paid)         onPaymentSuccess();
-      else if (data?.status === expired) showExpired();
-      else                               _scheduleNextPoll();
-    })
-    .catch(() => {
+      if (!handleApiError(err)) _scheduleNextPoll();
+    } else {
+      // 网络 / 超时异常：累计错误次数
       if (++_pollErrors >= CONFIG.poll.maxErrors) showTimeout();
       else _scheduleNextPoll();
-    });
+    }
+  }
 }
 
 function _scheduleNextPoll() {
@@ -851,11 +920,17 @@ function stopPolling() {
   clearTimeout(_pollTimer);
 }
 
-function retryPolling() {
+/** 重置轮询状态并立即发起一次请求 */
+function _resumePolling() {
   _pollErrors  = 0;
   _pollStopped = false;
-  hideStatePanel();
+  clearTimeout(_pollTimer);
   checkOrderStatus();
+}
+
+function retryPolling() {
+  hideStatePanel();
+  _resumePolling();
 }
 
 
@@ -863,35 +938,24 @@ function retryPolling() {
 //  SECTION 11 — 支付状态处理
 // ═══════════════════════════════════════════════════════════════
 
-function onPaymentSuccess() {
+/** 进入终态面板：停止轮询，可选清除倒计时 / 禁用转账按钮 */
+function _enterTerminalState(panel, { clearTimer = true, disableBtn = true } = {}) {
   stopPolling();
-  clearInterval(_countdownInterval);
-  showStatePanel('success');
+  if (clearTimer && _countdownInterval) { clearInterval(_countdownInterval); _countdownInterval = null; }
+  if (disableBtn) { const btn = $('btn-transferred'); if (btn) btn.disabled = true; }
+  showStatePanel(panel);
+}
+
+function onPaymentSuccess() {
+  _enterTerminalState('success');
   if (ORDER?.redirectUrl && !ORDER.redirectUrl.startsWith('{{')) {
     setTimeout(() => { window.location.href = ORDER.redirectUrl; }, CONFIG.redirect.delay);
   }
 }
 
-function showExpired() {
-  stopPolling();
-  clearInterval(_countdownInterval);
-  const btn = $('btn-transferred');
-  if (btn) btn.disabled = true;
-  showStatePanel('expired');
-}
-
-function showTimeout() {
-  stopPolling();
-  showStatePanel('timeout');
-}
-
-function showNotFound() {
-  stopPolling();
-  clearInterval(_countdownInterval);
-  const btn = $('btn-transferred');
-  if (btn) btn.disabled = true;
-  showStatePanel('not-found');
-}
+function showExpired()  { _enterTerminalState('expired'); }
+function showTimeout()  { _enterTerminalState('timeout', { clearTimer: false, disableBtn: false }); }
+function showNotFound() { _enterTerminalState('not-found'); }
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -905,10 +969,7 @@ function handleTransfer() {
   if (!span) return;
   span.textContent = t('verifying');
   btn.disabled     = true;
-  _pollErrors  = 0;
-  _pollStopped = false;
-  clearTimeout(_pollTimer);
-  checkOrderStatus();
+  _resumePolling();
   setTimeout(() => {
     span.textContent = t('i_have_transferred');
     btn.disabled     = false;
@@ -924,7 +985,7 @@ function connectWallet() {
 //  SECTION 13 — 初始化入口
 // ═══════════════════════════════════════════════════════════════
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   setLang(detectLang());
 
   if (!ORDER?.tradeId || ORDER.tradeId.startsWith('{{')) {
@@ -933,23 +994,14 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // 在 Step 1 阶段就填充订单信息卡片
+  renderOrderCard();
   if (ORDER.amount && !ORDER.amount.startsWith('{{')) {
-    renderRow('display-fiat', t('order_amount'), `${ORDER.amount} ${ORDER.currency || ''}`);
     setText('display-amount', `${ORDER.amount} ${ORDER.currency || ''}`);
   }
-  renderOrderId();
 
-  // 确保 PAYMENT_OPTIONS 存在（服务端未注入时降级为内置默认选项）
-  if (typeof PAYMENT_OPTIONS === 'undefined' || !Array.isArray(PAYMENT_OPTIONS) || !PAYMENT_OPTIONS.length) {
-    window.PAYMENT_OPTIONS = [
-      { token: 'USDT', network: 'TRON',     actualAmount: ORDER.actualAmount, receiveAddress: ORDER.receiveAddress },
-      { token: 'TRX',  network: 'TRON',     actualAmount: ORDER.actualAmount, receiveAddress: ORDER.receiveAddress },
-      { token: 'USDT', network: 'Solana',   actualAmount: ORDER.actualAmount, receiveAddress: ORDER.receiveAddress },
-      { token: 'USDC', network: 'Solana',   actualAmount: ORDER.actualAmount, receiveAddress: ORDER.receiveAddress },
-      { token: 'USDT', network: 'Ethereum', actualAmount: ORDER.actualAmount, receiveAddress: ORDER.receiveAddress },
-      { token: 'USDC', network: 'Ethereum', actualAmount: ORDER.actualAmount, receiveAddress: ORDER.receiveAddress },
-    ];
-  }
+  // 从 API 获取支持的网络和币种
+  window.PAYMENT_OPTIONS = await fetchSupportedAssets();
+  if (!PAYMENT_OPTIONS?.length) return;
 
   // isselect=true 时跳过 Step 1，直接进入支付面板
   const _isSelect = ORDER.is_selected && ORDER.is_selected !== 'false' && !ORDER.is_selected.startsWith('{{');
@@ -968,5 +1020,3 @@ document.addEventListener('DOMContentLoaded', () => {
   const walletBtn = $('btn-connect-wallet');
   if (walletBtn) walletBtn.style.display = CONFIG.wallet.enabled ? '' : 'none';
 });
-
-
